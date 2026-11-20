@@ -19,27 +19,27 @@ app:
   version: 0.1.0
   # Never use the word "by" here: the badge is parsed on it.
   summary: >-
-    Works out whether an e-bike or the tube and bus is quicker and cheaper for
-    a London trip, and picks a Lime or Santander e-bike with enough battery
-    for the distance, the hills and the wind. It checks rain on the ride and
-    any weekly travel budget you mention, and sends only place names and
-    coordinates to TfL, Lime, Open-Meteo and OpenStreetMap.
+    Live check of Lime and Santander e-bikes, their battery, and whether an
+    e-bike beats the tube or bus in London. It picks a bike with enough charge
+    for the distance, hills and wind, checks rain on the ride and any weekly
+    travel budget you mention, and sends only place names and coordinates to
+    TfL, Lime, Open-Meteo and OpenStreetMap.
 
 agent_types:
   - personal
 
 outcomes:
   - id: ebike.trip
-    summary: Choose between an e-bike and the tube or bus for a London trip
+    summary: Live e-bike battery and dock check against the tube or bus for a London trip
     example_phrases:
       - should i get an e-bike or the tube
+      - find a lime bike with enough battery
+      - is there a santander e-bike near
       - is it quicker to cycle or take the tube
-      - find an e-bike with enough battery to get to
-      - is there a lime bike that can get me to
-      - e-bike or bus to get to
-      - can i make it there on a santander e-bike
-      - cheapest way to get there on an e-bike
-      - will a lime bike get me up the hill to
+      - lime bike or bus to get to
+      - will a lime e-bike manage the hill
+      - cheapest way there on an e-bike
+      - e-bike or tube to get there
     inputs:
       - name: origin
         type: string
