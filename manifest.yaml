@@ -16,7 +16,7 @@ app_author_name: "fdb06"
 app:
   id: hack.app_33b2
   name: Charged
-  version: 0.1.0
+  version: 0.1.1
   # Never use the word "by" here: the badge is parsed on it.
   summary: >-
     Live Santander e-bike check against the tube or bus in London, and the Lime
