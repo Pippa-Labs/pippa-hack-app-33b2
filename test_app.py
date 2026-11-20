@@ -1,156 +1,270 @@
-"""Tests for your app. Run them with `pytest`.
+"""Tests for Charged. The network is stubbed: no test calls a real API.
 
-Keep these. Publishing runs them, and a repository whose tests fail does not
-deploy — which is the fastest feedback you will get all day, because the
-alternative is finding out from a user that your app answers wrongly.
-
-`LocalRunner` is the same code the production runtime uses to call your app.
-So a call that works here works deployed, and — more usefully — a `Result`
-that violates your manifest fails here exactly as it would in production.
-That is the whole reason to test through the runner rather than calling
-`App().handle(...)` directly.
+`fake_fetch` answers each URL with a small captured-shape payload, so the
+tests check the decisions (which bike, rain, budget) rather than live data.
 """
 
 from __future__ import annotations
 
+import json
+import urllib.error
 from datetime import datetime, timezone
 
 import pytest
-from pippa_agentapp_sdk import LocalRunner, OutputShapeViolation
+from pippa_agentapp_sdk import LocalRunner
 
-from app import App, CannotReadDate
+import app as app_module
+from app import App, MissingPlace, PlaceNotFound
 
-# A fixed "now", so a test that passes today still passes next March.
-# 21:00 UTC on purpose: it is already the next day in New Zealand, which is
-# what makes the time zone test below mean anything. At 09:00 UTC it is still
-# the same day everywhere that matters, and the test would pass whether or not
-# the code handled time zones at all.
-NOW = datetime(2026, 10, 22, 21, 0, tzinfo=timezone.utc)
+# 14:00 UTC on a Friday: the ride starts inside the 14:00 hour.
+NOW = datetime(2026, 11, 20, 14, 0, tzinfo=timezone.utc)
+
+SOUTH_KEN = (51.4941, -0.1738)
+CAMDEN = (51.5390, -0.1426)
 
 
-def call(inputs: dict, outcome: str = "days.until", *, explicit: bool = False):
-    """Run one outcome the way the runtime does, and return the Result.
+def nominatim(point, name):
+    return [{"lat": str(point[0]), "lon": str(point[1]),
+             "display_name": f"{name}, London, Greater London, England"}]
 
-    `granted_secrets` is required even though a hackathon app never has any —
-    the runner takes it on every call, so an empty dict is how you say "none".
 
-    `explicit=True` calls the app the way Pippa does when the person picked
-    it by name (`@Days Until ...`) instead of Pippa choosing it. The app sees
-    it as `call.context.explicit`.
-    """
-    return LocalRunner(App()).call(
-        outcome, inputs, granted_secrets={}, now=NOW, request_id="test-1",
+def lime_bikes():
+    return {"data": {"bikes": [
+        # Right next to the start, almost flat: must be skipped.
+        {"bike_id": "a", "lat": 51.4942, "lon": -0.1737, "is_reserved": False,
+         "is_disabled": False, "vehicle_type_id": "ebike", "current_range_meters": 1500},
+        # A few minutes away with plenty of range: the one to pick.
+        {"bike_id": "b", "lat": 51.4965, "lon": -0.1745, "is_reserved": False,
+         "is_disabled": False, "vehicle_type_id": "ebike", "current_range_meters": 30000},
+        # A scooter with lots of range: never offered.
+        {"bike_id": "c", "lat": 51.4941, "lon": -0.1738, "is_reserved": False,
+         "is_disabled": False, "vehicle_type_id": "scooter", "current_range_meters": 40000},
+    ]}}
+
+
+LIME_TYPES = {"data": {"vehicle_types": [
+    {"vehicle_type_id": "ebike", "form_factor": "bicycle", "propulsion_type": "electric_assist"},
+    {"vehicle_type_id": "scooter", "form_factor": "scooter", "propulsion_type": "electric"},
+]}}
+
+LIME_DISCOVERY = {"data": {"en": {"feeds": [
+    {"name": "free_bike_status", "url": "https://data.lime.bike/x/free_bike_status"},
+    {"name": "vehicle_types", "url": "https://data.lime.bike/x/vehicle_types"},
+]}}}
+
+
+def dock(name, point, ebikes, empty):
+    return {"commonName": name, "lat": point[0], "lon": point[1],
+            "additionalProperties": [
+                {"key": "Installed", "value": "true"},
+                {"key": "Locked", "value": "false"},
+                {"key": "NbEBikes", "value": str(ebikes)},
+                {"key": "NbEmptyDocks", "value": str(empty)},
+            ]}
+
+
+BIKEPOINT = [
+    dock("Exhibition Road, Knightsbridge", (51.4960, -0.1740), 2, 5),
+    dock("Parkway, Camden Town", (51.5385, -0.1430), 0, 7),
+]
+
+
+def weather(precip=None, chance=20, wind=10.0, wind_from=0.0):
+    times = [f"2026-11-20T{h:02d}:{m:02d}" for h in range(14, 17) for m in (0, 15, 30, 45)]
+    precip = precip if precip is not None else [0.0] * len(times)
+    hours = [f"2026-11-20T{h:02d}:00" for h in range(14, 17)]
+    return {"minutely_15": {"time": times, "precipitation": precip},
+            "hourly": {"time": hours, "precipitation_probability": [chance] * 3},
+            "current": {"wind_speed_10m": wind, "wind_direction_10m": wind_from}}
+
+
+def journey(minutes=34, fare=290):
+    return {"journeys": [{"duration": minutes, "fare": {"totalCost": fare}},
+                         {"duration": minutes + 6, "fare": {"totalCost": fare}}]}
+
+
+def make_fetch(**overrides):
+    payloads = {
+        "nominatim": None,
+        "lime_discovery": LIME_DISCOVERY,
+        "lime_bikes": lime_bikes(),
+        "lime_types": LIME_TYPES,
+        "bikepoint": BIKEPOINT,
+        "journey": journey(),
+        "weather": weather(),
+        "elevation": {"elevation": [10.0, 40.0]},
+    }
+    payloads.update(overrides)
+
+    def fake_fetch(url, timeout=6.0):
+        if "nominatim" in url:
+            if payloads["nominatim"] is not None:
+                return json.dumps(payloads["nominatim"]).encode()
+            if "Camden" in url:
+                return json.dumps(nominatim(CAMDEN, "Camden Market")).encode()
+            if "Narnia" in url:
+                return b"[]"
+            return json.dumps(nominatim(SOUTH_KEN, "South Kensington")).encode()
+        key = None
+        if "gbfs.json" in url:
+            key = "lime_discovery"
+        elif "free_bike_status" in url:
+            key = "lime_bikes"
+        elif "vehicle_types" in url:
+            key = "lime_types"
+        elif "BikePoint" in url:
+            key = "bikepoint"
+        elif "Journey" in url:
+            key = "journey"
+        elif "elevation" in url:
+            key = "elevation"
+        elif "forecast" in url:
+            key = "weather"
+        value = payloads[key]
+        if isinstance(value, Exception):
+            raise value
+        return json.dumps(value).encode()
+
+    return fake_fetch
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(app_module.time, "sleep", lambda s: None)
+
+
+def run(inputs, fetch=None, explicit=False):
+    instance = App()
+    instance._fetch = fetch or make_fetch()
+    return LocalRunner(instance).call(
+        "ebike.trip", inputs, granted_secrets={}, now=NOW, request_id="t1",
         explicit=explicit,
     ).result
 
 
+TRIP = {"origin": "South Kensington", "destination": "Camden Market"}
+
+
 def test_the_manifest_is_valid():
-    """The first thing to break, and the easiest to miss.
-
-    `App()` validates manifest.yaml as it is constructed, so this fails the
-    moment the manifest is malformed — before anything else has a chance to
-    produce a more confusing error.
-    """
-    app = App()
-    assert app.manifest.app_id.startswith("hack.")
-    assert [o.id for o in app.manifest.outcomes] == ["days.until"]
+    assert App().manifest.app_id == "hack.app_33b2"
 
 
-def test_it_counts_the_days():
-    result = call({"date": "2026-12-25"})
-    assert result.data["days"] == 64
-    assert result.data["target_date"] == "2026-12-25"
-    assert result.data["weekday"] == "Friday"
-    assert result.data["already_passed"] is False
+NO_SANTANDER_EBIKES = [dock("Exhibition Road, Knightsbridge", (51.4960, -0.1740), 0, 5)]
 
 
-def test_a_date_written_in_words_works():
-    result = call({"date": "25 December"})
-    assert result.data["target_date"] == "2026-12-25"
+def test_it_picks_a_lime_with_enough_battery_and_skips_the_flat_one():
+    data = run(TRIP, make_fetch(bikepoint=NO_SANTANDER_EBIKES)).data
+    assert data["verdict"] == "lime"
+    assert data["bike_operator"] == "Lime"
+    assert data["bike_range_km"] == 30.0
+    assert data["low_battery_bikes_skipped"] == 1
+    assert data["range_needed_km"] > data["trip_km"]
+    assert "Skip the 1 closer one" in data["summary"]
 
 
-def test_a_date_already_gone_rolls_to_next_year():
-    """`1 January` asked in October means the January that is coming."""
-    result = call({"date": "1 January"})
-    assert result.data["target_date"] == "2027-01-01"
-    assert result.data["already_passed"] is False
+def test_a_cheaper_santander_wins_when_nearly_as_fast():
+    data = run(TRIP).data
+    assert data["verdict"] == "santander"
+    assert data["bike_cost_gbp"] == 3.3
 
 
-def test_the_users_timezone_decides_what_today_is():
-    """21:00 UTC is already tomorrow in Auckland.
-
-    Worth a test of its own: it is the bug every date app has, it only shows
-    up for users in some parts of the world, and it is invisible if you only
-    ever test from one place.
-    """
-    here = call({"date": "2026-10-23"}).data["days"]
-    there = call({"date": "2026-10-23", "timezone": "Pacific/Auckland"}).data["days"]
-    assert here == 1    # still the 22nd in UTC
-    assert there == 0   # already the 23rd in Auckland
+def test_the_climb_raises_the_range_needed():
+    flat = run(TRIP, make_fetch(elevation={"elevation": [10.0, 10.0]})).data
+    hilly = run(TRIP, make_fetch(elevation={"elevation": [10.0, 110.0]})).data
+    assert hilly["range_needed_km"] > flat["range_needed_km"]
+    assert hilly["climb_m"] == 100
 
 
-def test_a_made_up_timezone_never_reaches_the_app():
-    """The platform checks declared types before your code runs.
-
-    `type: timezone` in the manifest means the runtime validates it. So your
-    app does not need to — and should not, because a hand-rolled check here
-    would be dead code that looks load-bearing.
-    """
-    from pippa_agentapp_sdk import InputShapeViolation
-
-    with pytest.raises(InputShapeViolation):
-        call({"date": "2026-12-25", "timezone": "Mars/Olympus"})
+def test_a_headwind_raises_the_range_needed():
+    # The trip heads roughly north, so wind from the north is a headwind.
+    calm = run(TRIP, make_fetch(weather=weather(wind=0.0))).data
+    windy = run(TRIP, make_fetch(weather=weather(wind=30.0, wind_from=0.0))).data
+    assert windy["headwind_kmh"] > 20
+    assert windy["range_needed_km"] > calm["range_needed_km"]
 
 
-def test_no_date_is_an_error_a_user_can_read():
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""})
-    # `user_message` is the only part a user may be shown, so it is the part
-    # worth asserting on. The rest stays in the logs.
-    assert failure.value.user_message == "I could not work out which date you meant."
+def test_all_day_rain_sends_you_on_the_tube():
+    data = run(TRIP, make_fetch(weather=weather(precip=[1.2] * 12, chance=90))).data
+    assert data["verdict"] == "public_transport"
+    assert "rain" in data["summary"].lower()
 
 
-def test_nonsense_is_refused_rather_than_guessed():
-    with pytest.raises(CannotReadDate):
-        call({"date": "a week on Thursday-ish"})
+def test_rain_near_the_end_says_when_it_starts():
+    precip = [0.0, 0.0, 0.8, 0.8] + [0.8] * 8   # wet from 14:30
+    data = run(TRIP, make_fetch(weather=weather(precip=precip, chance=80))).data
+    assert "14:30" in data["rain"]
 
 
-def test_picked_by_name_it_answers_and_refuses_as_usual():
-    """`@Days Until ...` in the chat: the person picked this app themselves.
-
-    Then nothing checks whether the message suits the app. It is called
-    whatever the words, and `call.context.explicit` is True. The right
-    response is the ordinary one: answer what you can, and refuse only for a
-    missing or unreadable input, with a sentence that says what was wrong.
-    Never refuse because the message does not look like your example phrases
-    — the person has already told you it is for you.
-
-    This app never reads the flag, because it never needed to: it already
-    refuses only for a missing or unreadable date. If yours does, read it as
-    `getattr(call.context, "explicit", False)`. An app published before the
-    platform update that added the flag runs on an SDK that does not have
-    it, until you publish it again.
-    """
-    picked = call({"date": "2026-12-25"}, explicit=True)
-    assert picked.data == call({"date": "2026-12-25"}).data
-
-    with pytest.raises(CannotReadDate) as failure:
-        call({"date": ""}, explicit=True)
-    assert failure.value.user_message == "I could not work out which date you meant."
+def test_over_budget_takes_the_bus():
+    data = run(dict(TRIP, budget_left_gbp=2.0)).data
+    assert data["verdict"] == "public_transport"
+    assert "more than" in data["budget_note"]
 
 
-def test_the_runner_enforces_the_manifest(monkeypatch):
-    """Proof that the contract is real, and the reason to test through it.
+def test_budget_pace_over_several_days():
+    data = run(dict(TRIP, budget_left_gbp=12.0, days_left=4)).data
+    assert "a day" in data["budget_note"]
 
-    An app returning a field it did not declare is refused. You will meet this
-    error if you add something to `data` and forget to add it to `output` in
-    manifest.yaml — which is the single most common way a first app fails
-    after it deploys.
-    """
-    from pippa_agentapp_sdk import Result
 
-    monkeypatch.setattr(
-        App, "handle", lambda self, c: Result(data={"surprise": "hello"})
-    )
-    with pytest.raises(OutputShapeViolation):
-        call({"date": "2026-12-25"})
+def test_fare_cap_makes_the_tube_free():
+    data = run(dict(TRIP, fare_cap_reached=True),
+               make_fetch(journey=journey(minutes=30))).data
+    assert data["transit_cost_gbp"] == 0.0
+
+
+def test_lime_down_falls_back_to_santander():
+    fetch = make_fetch(lime_discovery=urllib.error.URLError("down"))
+    data = run(TRIP, fetch).data
+    assert data["bike_operator"] == "Santander Cycles"
+    assert "Exhibition Road" in data["bike_pickup"]
+    assert "Parkway" in data["parking"]
+    assert "Lime" in data["data_note"]
+
+
+def test_no_bikes_and_no_journey_is_a_clear_error():
+    fetch = make_fetch(lime_discovery=urllib.error.URLError("down"),
+                       bikepoint=urllib.error.URLError("down"),
+                       journey=TimeoutError("slow"))
+    with pytest.raises(app_module.NothingToCompare):
+        run(TRIP, fetch)
+
+
+def test_missing_start_asks_for_it():
+    with pytest.raises(MissingPlace) as failure:
+        run({"origin": "", "destination": "Camden Market"})
+    assert "Where are you starting from" in failure.value.user_message
+
+
+def test_unknown_place_is_named():
+    with pytest.raises(PlaceNotFound) as failure:
+        run({"origin": "Narnia", "destination": "Camden Market"})
+    assert "Narnia" in failure.value.user_message
+
+
+def test_picked_by_name_answers_the_same():
+    assert run(TRIP, explicit=True).data == run(TRIP).data
+
+
+def test_limeprime_makes_the_lime_cheaper():
+    fetch = lambda: make_fetch(bikepoint=NO_SANTANDER_EBIKES)
+    normal = run(TRIP, fetch()).data
+    prime = run(dict(TRIP, has_lime_prime=True), fetch()).data
+    assert prime["bike_cost_gbp"] < normal["bike_cost_gbp"]
+    # A 28 minute ride: £1.70 covers 20 minutes, then 8 minutes at 31p.
+    assert prime["bike_cost_gbp"] == 4.18
+
+
+def test_santander_members_pay_a_pound():
+    assert run(dict(TRIP, santander_member=True)).data["bike_cost_gbp"] == 1.0
+
+
+def test_unmentioned_subscriptions_are_offered_as_a_tip():
+    data = run(TRIP).data
+    assert "LimePrime" in data["subscription_tip"]
+    assert "Santander Cycles membership" in data["subscription_tip"]
+    assert "If you have a subscription" in data["summary"]
+
+
+def test_no_tip_once_the_user_says_they_subscribe():
+    data = run(dict(TRIP, has_lime_prime=True, santander_member=True)).data
+    assert "subscription_tip" not in data
