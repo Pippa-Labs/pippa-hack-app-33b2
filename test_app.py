@@ -78,9 +78,22 @@ def weather(precip=None, chance=20, wind=10.0, wind_from=0.0):
             "current": {"wind_speed_10m": wind, "wind_direction_10m": wind_from}}
 
 
+def leg(mode, route=""):
+    return {"mode": {"name": mode}, "routeOptions": [{"name": route}]}
+
+
 def journey(minutes=34, fare=290):
-    return {"journeys": [{"duration": minutes, "fare": {"totalCost": fare}},
-                         {"duration": minutes + 6, "fare": {"totalCost": fare}}]}
+    return {"journeys": [
+        {"duration": minutes, "fare": {"totalCost": fare},
+         "legs": [leg("walking"), leg("tube", "Piccadilly"), leg("tube", "Northern"),
+                  leg("walking")]},
+        # A bus that is a little slower and much cheaper.
+        {"duration": minutes + 6, "fare": {"totalCost": 175},
+         "legs": [leg("walking"), leg("bus", "C2"), leg("walking")]},
+        # A bus that is far slower: never offered as the cheaper option.
+        {"duration": minutes + 30, "fare": {"totalCost": 175},
+         "legs": [leg("bus", "88")]},
+    ]}
 
 
 def make_fetch(**overrides):
@@ -268,3 +281,26 @@ def test_unmentioned_subscriptions_are_offered_as_a_tip():
 def test_no_tip_once_the_user_says_they_subscribe():
     data = run(dict(TRIP, has_lime_prime=True, santander_member=True)).data
     assert "subscription_tip" not in data
+
+
+def test_the_route_is_named():
+    data = run(TRIP).data
+    assert data["transit_route"] == "Piccadilly line, then Northern line"
+
+
+def test_a_cheaper_bus_that_is_not_much_slower_is_offered():
+    data = run(TRIP).data
+    assert data["cheaper_transit"] == "bus C2: 40 min, £1.75"
+
+
+def test_on_a_tight_budget_it_picks_the_cheaper_bus():
+    data = run(dict(TRIP, budget_left_gbp=2.0)).data
+    assert data["verdict"] == "public_transport"
+    assert data["transit_route"] == "bus C2"
+    assert data["transit_cost_gbp"] == 1.75
+    assert data["summary"].startswith("Take the bus C2")
+
+
+def test_no_cheaper_option_once_the_fare_cap_is_hit():
+    data = run(dict(TRIP, fare_cap_reached=True)).data
+    assert "cheaper_transit" not in data

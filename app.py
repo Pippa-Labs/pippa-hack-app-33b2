@@ -241,7 +241,18 @@ class App:
         transit = feeds["journey"]
         cap = bool(call.inputs.get("fare_cap_reached"))
         if transit is not None and cap:
-            transit = dict(transit, pence=0)
+            transit = dict(transit, pence=0, cheaper=None)
+
+        # On a budget, use the cheaper route when the fastest one doesn't fit.
+        budget_gbp = call.inputs.get("budget_left_gbp")
+        if transit is not None and transit.get("cheaper") and budget_gbp is not None:
+            days = call.inputs.get("days_left")
+            days = days if isinstance(days, int) and days > 0 else 1
+            daily = round(float(budget_gbp) * 100) // days
+            if transit["pence"] is not None and transit["pence"] > daily:
+                cheaper = transit["cheaper"]
+                transit = dict(cheaper, cheaper=None)
+                notes.append("Using the cheaper public transport route to fit your budget.")
 
         if bike is None and transit is None:
             raise NothingToCompare("no bike option and no journey plan")
@@ -278,6 +289,11 @@ class App:
         data["range_needed_km"] = round(needed_km, 1)
         if transit is not None:
             data["transit_minutes"] = transit["minutes"]
+            data["transit_route"] = transit.get("route") or "public transport"
+            if transit.get("cheaper"):
+                c = transit["cheaper"]
+                data["cheaper_transit"] = (f"{c['route']}: {c['minutes']} min, "
+                                           f"{money(c['pence'])}")
             if transit.get("pence") is not None:
                 data["transit_cost_gbp"] = pounds(transit["pence"])
         else:
@@ -389,10 +405,47 @@ class App:
         journeys = [j for j in plan.get("journeys") or [] if j.get("duration")]
         if not journeys:
             return None
-        best = min(journeys, key=lambda j: j["duration"])
-        fare = (best.get("fare") or {}).get("totalCost")
-        return {"minutes": int(best["duration"]),
-                "pence": int(fare) if isinstance(fare, (int, float)) else None}
+        options = [self._journey_option(j) for j in journeys]
+        best = min(options, key=lambda o: o["minutes"])
+        # A cheaper route that is not much slower (often a bus instead of the tube).
+        cheaper = [o for o in options
+                   if o["pence"] is not None and best["pence"] is not None
+                   and o["pence"] < best["pence"]
+                   and o["minutes"] - best["minutes"] <= WORTH_PAYING_MIN]
+        best["cheaper"] = min(cheaper, key=lambda o: (o["pence"], o["minutes"])) if cheaper else None
+        return best
+
+    @staticmethod
+    def _journey_option(journey: dict) -> dict:
+        """Minutes, fare and a readable route such as 'bus 14, then Northern line'."""
+        names = {"tube": "{} line", "bus": "bus {}", "overground": "{} (Overground)",
+                 "elizabeth-line": "Elizabeth line", "dlr": "DLR",
+                 "national-rail": "train", "river-bus": "river bus {}"}
+        steps, modes = [], []
+        for leg in journey.get("legs") or []:
+            mode = ((leg.get("mode") or {}).get("name") or "").lower()
+            if not mode or mode == "walking":
+                continue
+            route = ((leg.get("routeOptions") or [{}])[0] or {}).get("name") or ""
+            label = names.get(mode, mode + " {}").format(route).strip()
+            if not steps or steps[-1] != label:
+                steps.append(label)
+            modes.append(mode)
+        fare = (journey.get("fare") or {}).get("totalCost")
+        if not modes:
+            kind = "walk"
+        elif all(m == "bus" for m in modes):
+            kind = "bus"
+        elif all(m == "tube" for m in modes):
+            kind = "tube"
+        else:
+            kind = "public transport"
+        return {
+            "minutes": int(journey["duration"]),
+            "pence": int(fare) if isinstance(fare, (int, float)) else None,
+            "route": ", then ".join(steps) if steps else "walk",
+            "kind": kind,
+        }
 
     def _weather(self, a) -> dict:
         query = urlencode({
@@ -656,8 +709,14 @@ class App:
             if transit:
                 fare = (f", {money(transit['pence'])}" if transit.get("pence") is not None
                         else "")
-                parts.append(f"Take the tube or bus{why}: about {transit['minutes']} "
-                             f"min door to door{fare}.")
+                kind, route = transit.get("kind", "public transport"), transit.get("route", "")
+                how = f"the {route}" if route.startswith(kind) else f"the {kind} ({route})"
+                parts.append(f"Take {how}{why}: about {transit['minutes']} min door "
+                             f"to door{fare}.")
+                if transit.get("cheaper"):
+                    c = transit["cheaper"]
+                    parts.append(f"Cheaper: {c['route']}, {c['minutes']} min for "
+                                 f"{money(c['pence'])}.")
             else:
                 parts.append(f"Take public transport{why}.")
             if bike:
@@ -675,7 +734,10 @@ class App:
             parts.append(lead)
             compare = f"About {bike['minutes']} min door to door, {money(bike['pence'])}"
             if transit:
-                compare += f", against {transit['minutes']} min on the tube or bus"
+                compare += (f", against {transit['minutes']} min by "
+                            f"{transit.get('route', 'public transport')}")
+                if transit.get("pence") is not None:
+                    compare += f" ({money(transit['pence'])})"
             parts.append(compare + ".")
         if rain:
             parts.append(rain["text"])
