@@ -25,7 +25,7 @@ import math
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -87,6 +87,12 @@ WET_MM = 0.1             # a 15-minute block with this much rain counts as wet
 LIKELY_RAIN_PCT = 60
 CLOSE_ENOUGH_MIN = 5     # a bike this much slower is still worth it
 WORTH_PAYING_MIN = 10    # over budget pace, a bike must save this much time
+
+# ── Time budget: Pippa stops the app at 20 seconds ──────────────────────────
+# Worst case: two map lookups (4 s each) + the 1 s pause + 9 s for every feed
+# at once = 18 s. A feed still loading at the deadline is left out.
+GEOCODE_TIMEOUT = 4.0
+FEEDS_DEADLINE = 9.0
 
 
 # ── Errors a user may see ────────────────────────────────────────────────────
@@ -307,11 +313,15 @@ class App:
             data["rain"] = rain["text"]
         if budget_note:
             data["budget_note"] = budget_note
+        if lime is None:
+            data["lime_advice"] = self._lime_advice(needed_km, ride_min, lime_prime)
         tip = self._subscription_tip(lime, santander)
         if tip:
             data["subscription_tip"] = tip
 
         data["summary"] = self._summary(verdict, bike, transit, rain, reasons)
+        if data.get("lime_advice"):
+            data["summary"] += " " + data["lime_advice"]
         if tip:
             data["summary"] += " " + tip
         notes.append(
@@ -329,7 +339,7 @@ class App:
             "viewbox": LONDON_VIEWBOX, "bounded": 1,
         })
         try:
-            results = self._json(NOMINATIM + query, timeout=5.0)
+            results = self._json(NOMINATIM + query, timeout=GEOCODE_TIMEOUT)
         except urllib.error.HTTPError as exc:   # before URLError: it is one
             if exc.code == 429:
                 raise ServiceBusy(f"nominatim rate limited: {exc.code}")
@@ -350,23 +360,29 @@ class App:
         """Fetch every feed at once. A feed that fails comes back as None."""
         jobs = {
             "lime": lambda: self._lime(),
-            "bikepoint": lambda: self._json(TFL_BIKEPOINT, timeout=8.0),
+            "bikepoint": lambda: self._json(TFL_BIKEPOINT, timeout=FEEDS_DEADLINE),
             "journey": lambda: self._journey(a, b),
             "weather": lambda: self._weather(a),
             "elevation": lambda: self._elevation(a, b),
         }
         out = {}
-        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-            futures = {name: pool.submit(job) for name, job in jobs.items()}
-            for name, future in futures.items():
-                try:
-                    out[name] = future.result(timeout=12)
-                except Exception:   # one feed failing must not sink the answer
-                    out[name] = None
+        pool = ThreadPoolExecutor(max_workers=len(jobs))
+        futures = {name: pool.submit(job) for name, job in jobs.items()}
+        wait(futures.values(), timeout=FEEDS_DEADLINE)
+        for name, future in futures.items():
+            if not future.done():
+                out[name] = None    # too slow: answer without it
+                continue
+            try:
+                out[name] = future.result()
+            except Exception:       # one feed failing must not sink the answer
+                out[name] = None
+        # Don't wait for stragglers: the answer must go out inside 20 seconds.
+        pool.shutdown(wait=False, cancel_futures=True)
         return out
 
     def _lime(self) -> dict:
-        discovery = self._json(LIME_DISCOVERY, timeout=5.0)
+        discovery = self._json(LIME_DISCOVERY, timeout=3.0)
         feeds = {}
         for language in (discovery.get("data") or {}).values():
             for feed in language.get("feeds", []):
@@ -377,19 +393,19 @@ class App:
         for name, url in list(feeds.items()):
             if not str(url).startswith("https://data.lime.bike/"):
                 feeds.pop(name)
-        bikes = self._json(feeds["free_bike_status"], timeout=8.0)
+        bikes = self._json(feeds["free_bike_status"], timeout=5.0)
         result = {"bikes": (bikes.get("data") or {}).get("bikes") or [],
                   "types": {}, "stations": []}
         if feeds.get("vehicle_types"):
             try:
-                vt = self._json(feeds["vehicle_types"], timeout=5.0)
+                vt = self._json(feeds["vehicle_types"], timeout=2.0)
                 for t in (vt.get("data") or {}).get("vehicle_types") or []:
                     result["types"][t.get("vehicle_type_id")] = t
             except Exception:
                 pass
         if feeds.get("station_information"):
             try:
-                st = self._json(feeds["station_information"], timeout=5.0)
+                st = self._json(feeds["station_information"], timeout=2.0)
                 result["stations"] = (st.get("data") or {}).get("stations") or []
             except Exception:
                 pass
@@ -401,7 +417,7 @@ class App:
             "mode": "tube,bus,overground,elizabeth-line,dlr,national-rail,walking",
             "timeIs": "Departing",
         })
-        plan = self._json(TFL_JOURNEY + path + "?" + query, timeout=9.0)
+        plan = self._json(TFL_JOURNEY + path + "?" + query, timeout=FEEDS_DEADLINE)
         journeys = [j for j in plan.get("journeys") or [] if j.get("duration")]
         if not journeys:
             return None
@@ -481,7 +497,8 @@ class App:
     def _best_lime(self, feed, a, b, needed_km, ride_min, notes,
                    lime_prime=False) -> dict | None:
         if feed is None:
-            notes.append("Lime's public feed for London did not answer.")
+            notes.append("Lime doesn't publish live bike data for London, so Lime "
+                         "bikes and their battery can't be checked here.")
             return None
         candidates, skipped = [], 0
         for bike in feed["bikes"]:
@@ -604,6 +621,18 @@ class App:
                         f"destination ({dropoff[2]} empty dock"
                         f"{'s' if dropoff[2] != 1 else ''} now)"),
         }
+
+    @staticmethod
+    def _lime_advice(needed_km: float, ride_min: int, lime_prime: bool) -> str:
+        """No live Lime data: still say how much range a Lime needs, and its cost."""
+        payg = LIME_UNLOCK_PENCE + LIME_PER_MINUTE_PENCE * ride_min
+        prime = (LIMEPRIME_RIDE_PENCE
+                 + LIME_PER_MINUTE_PENCE * max(0, ride_min - LIMEPRIME_INCLUDED_MIN))
+        cost = money(prime) if lime_prime else (
+            f"{money(payg)} ({money(prime)} with LimePrime)")
+        return (f"If you'd rather use Lime, pick a bike showing at least "
+                f"{needed_km:.1f} km of range in the Lime app; the ride would cost "
+                f"about {cost}.")
 
     @staticmethod
     def _subscription_tip(*options) -> str | None:

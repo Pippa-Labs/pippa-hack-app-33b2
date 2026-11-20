@@ -304,3 +304,35 @@ def test_on_a_tight_budget_it_picks_the_cheaper_bus():
 def test_no_cheaper_option_once_the_fare_cap_is_hit():
     data = run(dict(TRIP, fare_cap_reached=True)).data
     assert "cheaper_transit" not in data
+
+
+def test_a_feed_that_hangs_is_left_out_not_waited_for(monkeypatch):
+    import threading
+    import time as real_time
+    monkeypatch.setattr(app_module, "FEEDS_DEADLINE", 0.3)
+    release = threading.Event()
+    base = make_fetch()
+
+    def slow_weather(url, timeout=6.0):
+        if "forecast" in url:
+            release.wait(5)
+        return base(url, timeout)
+
+    started = real_time.monotonic()
+    data = run(TRIP, slow_weather).data
+    release.set()
+    assert real_time.monotonic() - started < 3
+    assert "rain" not in data
+    assert "No weather forecast" in data["data_note"]
+
+
+def test_without_live_lime_data_it_says_what_range_to_look_for():
+    data = run(TRIP, make_fetch(lime_discovery=urllib.error.URLError("404"))).data
+    assert f"at least {data['range_needed_km']:.1f} km of range" in data["lime_advice"]
+    assert "LimePrime" in data["lime_advice"]
+    assert data["lime_advice"] in data["summary"]
+
+
+def test_no_lime_advice_when_a_live_lime_was_found():
+    data = run(TRIP, make_fetch(bikepoint=NO_SANTANDER_EBIKES)).data
+    assert "lime_advice" not in data

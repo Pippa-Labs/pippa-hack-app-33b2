@@ -19,18 +19,18 @@ app:
   version: 0.1.0
   # Never use the word "by" here: the badge is parsed on it.
   summary: >-
-    Live check of Lime and Santander e-bikes, their battery, and whether an
-    e-bike beats the tube or bus in London. It picks a bike with enough charge
-    for the distance, hills and wind, checks rain on the ride and any weekly
-    travel budget you mention, and sends only place names and coordinates to
-    TfL, Lime, Open-Meteo and OpenStreetMap.
+    Live Santander e-bike check against the tube or bus in London, and the Lime
+    battery range your trip needs. It works out the range from the distance,
+    hills and wind, checks rain on the ride and any weekly travel budget you
+    mention, and sends only place names and coordinates to TfL, Lime,
+    Open-Meteo and OpenStreetMap.
 
 agent_types:
   - personal
 
 outcomes:
   - id: ebike.trip
-    summary: Live e-bike battery and dock check against the tube or bus for a London trip
+    summary: Live e-bike, dock and battery-range check against the tube or bus in London
     example_phrases:
       - should i get an e-bike or the tube
       - find a lime bike with enough battery
@@ -170,6 +170,12 @@ outcomes:
         type: string
         required: false
         description: How the trip fits the travel budget the user mentioned.
+      - name: lime_advice
+        type: string
+        required: false
+        description: >-
+          When live Lime data isn't available, the battery range to look for in
+          the Lime app and what the ride would cost.
       - name: subscription_tip
         type: string
         required: false
